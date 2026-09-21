@@ -1,0 +1,2 @@
+# GEGL_GIMP_PLUGIN_color_balance
+color_balance
