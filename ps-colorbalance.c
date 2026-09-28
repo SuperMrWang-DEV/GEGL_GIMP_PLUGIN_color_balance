@@ -1,6 +1,7 @@
 /* GEGL Operation: Photoshop Color Balance 8bit ONLY
  * Code structure fully mimics hslseven.c buffer row processing style
  * Algorithm strictly follows reverse-engineered PS Color Balance (Preserve Luminosity UNCHECKED)
+ * NEW: Added Preserve Luminosity option, implemented by RGB delta zero-sum
  * REQUIREMENT: Input = Gamma encoded sRGB float (DO NOT use gegl:linear-rgb before this op)
  */
 #include "config.h"
@@ -56,6 +57,10 @@ property_double (highlight_yb, _("Highlight Yellow-Blue"), 0.0)
     value_range (-100.0, 100.0)
     ui_range (-100.0, 100.0)
 
+// ========= NEW: Preserve Luminosity ( zero-sum delta method) =========
+property_boolean (preserve_luminosity, _("Preserve Luminosity"), FALSE)
+    description (_("Preserve luminosity RGB delta zero-sum compensation. Not perceptual L*."))
+
 #else
 
 #define GEGL_OP_FILTER
@@ -89,7 +94,7 @@ static inline gfloat gammaCorrection255(gfloat input8, gdouble gamma)
     return (gfloat)outi;
 }
 
-// ===== Highlight (你原来hightLight函数) =====
+// ===== Highlight =====
 static inline gfloat highlightRight(gdouble value, gfloat input8)
 {
     gfloat result = (1.0f / (1.0f - 0.004f * (gfloat)value)) * input8;
@@ -162,7 +167,7 @@ static inline gfloat colorbalance_8bit_kernel(gfloat inFloat,
     gfloat lum = in8 / 255.0f;
     gfloat w_shd, w_mid, w_hlt;
 
-    // 简单权重（PS原生色调区间混合，可微调，匹配你Java测试）
+    // 简单权重 
     if (lum < 0.33f) {
         w_shd = 1.0f - lum / 0.33f;
         w_mid = lum / 0.33f;
@@ -201,6 +206,7 @@ process(GeglOperation       *op,
   gdouble shd_cr, shd_mg, shd_yb;
   gdouble mid_cr, mid_mg, mid_yb;
   gdouble hlt_cr, hlt_mg, hlt_yb;
+  gboolean preserve_lum;
 
   g_object_get(G_OBJECT(op),
     "shadow-cr", &shd_cr,
@@ -212,6 +218,7 @@ process(GeglOperation       *op,
     "highlight-cr", &hlt_cr,
     "highlight-mg", &hlt_mg,
     "highlight-yb", &hlt_yb,
+    "preserve-luminosity", &preserve_lum,
     NULL);
 
   gint stride = roi->width * 4;
@@ -228,17 +235,50 @@ process(GeglOperation       *op,
     for (gint x = 0; x < roi->width; x++)
     {
       gint px = x * 4;
-      gfloat r = in_line[px + 0];
-      gfloat g = in_line[px + 1];
-      gfloat b = in_line[px + 2];
+      gfloat r_in = in_line[px + 0];
+      gfloat g_in = in_line[px + 1];
+      gfloat b_in = in_line[px + 2];
       gfloat a = in_line[px + 3];
 
-      // R通道 <- Cyan/Red
-      out_line[px + 0] = colorbalance_8bit_kernel(r, shd_cr, mid_cr, hlt_cr);
-      // G通道 <- Magenta/Green
-      out_line[px + 1] = colorbalance_8bit_kernel(g, shd_mg, mid_mg, hlt_mg);
-      // B通道 <- Yellow/Blue
-      out_line[px + 2] = colorbalance_8bit_kernel(b, shd_yb, mid_yb, hlt_yb);
+      // 原有PS色彩平衡计算
+      gfloat r_raw = colorbalance_8bit_kernel(r_in, shd_cr, mid_cr, hlt_cr);
+      gfloat g_raw = colorbalance_8bit_kernel(g_in, shd_mg, mid_mg, hlt_mg);
+      gfloat b_raw = colorbalance_8bit_kernel(b_in, shd_yb, mid_yb, hlt_yb);
+
+      gfloat r_out, g_out, b_out;
+      if (preserve_lum)
+      {
+          //计算调色带来的增量，让总增量之和=0
+          gfloat dr = r_raw - r_in;
+          gfloat dg = g_raw - g_in;
+          gfloat db = b_raw - b_in;
+          gfloat sum_d = dr + dg + db;
+          gfloat offset = sum_d / 3.0f;
+
+          dr -= offset;
+          dg -= offset;
+          db -= offset;
+
+          r_out = r_in + dr;
+          g_out = g_in + dg;
+          b_out = b_in + db;
+      }
+      else
+      {
+          // 不勾选保留明度，原生PS行为不变
+          r_out = r_raw;
+          g_out = g_raw;
+          b_out = b_raw;
+      }
+
+      // Clamp 0~1
+      r_out = CLAMP(r_out, 0.0f, 1.0f);
+      g_out = CLAMP(g_out, 0.0f, 1.0f);
+      b_out = CLAMP(b_out, 0.0f, 1.0f);
+
+      out_line[px + 0] = r_out;
+      out_line[px + 1] = g_out;
+      out_line[px + 2] = b_out;
       out_line[px + 3] = sanitize_f(a);
     }
 
@@ -262,8 +302,8 @@ gegl_op_class_init(GeglOpClass *klass)
 
   gegl_operation_class_set_keys(oclass,
     "name",        "lb:ps-colorbalance",
-    "title",       _("Photoshop Color Balance 8bit (No Preserve Luminosity)"),
-    "description", _("Replicate Photoshop Color Balance Adjustment Layer, Preserve Luminosity UNCHECKED. 8-bit sRGB algorithm. Directly works on standard sRGB layers, DO NOT add linear-rgb node before operation."),
+    "title",       _("Color Balance"),
+    "description", _("Replicate Photoshop Color Balance Adjustment Layer. Preserve Luminosity:RGB delta zero-sum (RGB sum preserved, not perceptual L*). 8bit sRGB algorithm."),
     "gimp:menu-path", "<Image>/Colors/myfilters",
     "gimp:menu-label", _("PS Color Balance 8bit..."),
     NULL);
