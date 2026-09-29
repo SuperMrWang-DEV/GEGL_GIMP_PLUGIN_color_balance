@@ -1,15 +1,16 @@
 /* GEGL Operation: Photoshop Color Balance 8bit ONLY
  * Algorithm: Reverse-engineered PS Color Balance (8bit sRGB gamma encoded)
- * Feature: Preserve Luminosity 
+ * Feature: Preserve Luminosity
  *
  * -- Mode Switch --
- * preserve_luminosity = FALSE : original PS colorbalance 
- * preserve_luminosity = TRUE  : zero-sum (RGB-domain, NO HSL conversion)
+ * preserve_luminosity = FALSE : original PS colorbalance (independent channel)
+ * preserve_luminosity = TRUE  : pure zero-sum logic
+ *                               (normalize by median, then sign-aware
+ *                                cross-channel redistribution)
  *
- * zero-sum rule for each color axis:
- *   CR (Cyan-Red) : modify R, G+B get total reverse offset equal to R delta
- *   MG (Magenta-Green) : modify G, R+B get total reverse offset equal to G delta
- *   YB (Yellow-Blue) : modify B, R+G get total reverse offset equal to B delta
+ * Your shadow/midtone/highlight curves are preserved.
+ * Only the slider values are transformed before entering the kernel.
+ *
  * Requirement: Input = Gamma encoded sRGB float 0~1. DO NOT use linear-rgb before this op.
  */
 #include "config.h"
@@ -17,7 +18,6 @@
 #include <math.h>
 
 #ifdef GEGL_PROPERTIES
-// Shadows: Cyan-Red / Magenta-Green / Yellow-Blue, range -100 ~ +100
 property_double (shadow_cr, _("Shadow Cyan-Red"), 0.0)
     description (_("Shadow Cyan/Red slider (-100 Cyan ~ +100 Red)"))
     value_range (-100.0, 100.0)
@@ -33,7 +33,6 @@ property_double (shadow_yb, _("Shadow Yellow-Blue"), 0.0)
     value_range (-100.0, 100.0)
     ui_range (-100.0, 100.0)
 
-// Midtones
 property_double (midtone_cr, _("Midtone Cyan-Red"), 0.0)
     description (_("Midtone Cyan/Red slider (-100 Cyan ~ +100 Red)"))
     value_range (-100.0, 100.0)
@@ -49,7 +48,6 @@ property_double (midtone_yb, _("Midtone Yellow-Blue"), 0.0)
     value_range (-100.0, 100.0)
     ui_range (-100.0, 100.0)
 
-// Highlights
 property_double (highlight_cr, _("Highlight Cyan-Red"), 0.0)
     description (_("Highlight Cyan/Red slider (-100 Cyan ~ +100 Red)"))
     value_range (-100.0, 100.0)
@@ -65,9 +63,8 @@ property_double (highlight_yb, _("Highlight Yellow-Blue"), 0.0)
     value_range (-100.0, 100.0)
     ui_range (-100.0, 100.0)
 
-// Preserve Luminosity toggle
 property_boolean (preserve_luminosity, _("Preserve Luminosity"), FALSE)
-    description (_("Zero-sum mode. Unchecked: original PS color balance."))
+    description (_("Pure zero-sum logic. Unchecked: original PS color balance."))
 
 #else
 
@@ -76,11 +73,15 @@ property_boolean (preserve_luminosity, _("Preserve Luminosity"), FALSE)
 #define GEGL_OP_C_SOURCE ps-colorbalance.c
 #include "gegl-op.h"
 
+#ifndef MAX
+#define MAX(a,b) ((a) > (b) ? (a) : (b))
+#endif
+#ifndef MIN
+#define MIN(a,b) ((a) < (b) ? (a) : (b))
+#endif
+
 #define FLOAT_EPS       1e-12f
 
-/**
- * sanitize_f: cleanup invalid float (inf/nan)
- */
 static inline gfloat sanitize_f(gfloat v)
 {
   if (!isfinite(v))
@@ -88,9 +89,6 @@ static inline gfloat sanitize_f(gfloat v)
   return v;
 }
 
-/**
- * trimResult: clamp 0~255 for 8bit space
- */
 static inline gfloat trimResult(gfloat value)
 {
     if (value < 0.0f) return 0.0f;
@@ -98,9 +96,6 @@ static inline gfloat trimResult(gfloat value)
     return value;
 }
 
-/**
- * gammaCorrection255: gamma pow curve on 0~255 input
- */
 static inline gfloat gammaCorrection255(gfloat input8, gdouble gamma)
 {
     input8 = CLAMP(input8, 0.0f, 255.0f);
@@ -111,7 +106,7 @@ static inline gfloat gammaCorrection255(gfloat input8, gdouble gamma)
     return (gfloat)outi;
 }
 
-// ===== Highlight curve functions (original code unchanged) =====
+// ===== Highlight curve functions (unchanged) =====
 static inline gfloat highlightRight(gdouble value, gfloat input8)
 {
     gfloat result = (1.0f / (1.0f - 0.004f * (gfloat)value)) * input8;
@@ -129,7 +124,7 @@ static inline gfloat highlight(gdouble value, gfloat input8)
         return highlightLeft(value, input8);
 }
 
-// ===== Midtone curve functions (original code unchanged) =====
+// ===== Midtone curve functions (unchanged) =====
 static inline gfloat midtoneRight(gdouble value, gfloat input8)
 {
     return gammaCorrection255(input8, 1.0 - (0.005 * value));
@@ -146,7 +141,7 @@ static inline gfloat midtone(gdouble value, gfloat input8)
         return midtoneLeft(value, input8);
 }
 
-// ===== Shadow curve functions (original code unchanged) =====
+// ===== Shadow curve functions (unchanged) =====
 static inline gfloat shadowRight(gdouble value, gfloat input8)
 {
     return gammaCorrection255(input8, 1.0 - (0.003 * value));
@@ -168,14 +163,8 @@ static inline gfloat shadow(gdouble value, gfloat input8)
 }
 
 /**
- * colorbalance_8bit_kernel
- * Original raw kernel: apply single slider to ONE channel, return raw modified channel
- * This is your original PS curve + luminance weighted blend (shadow/mid/highlight)
- * @param inFloat: input channel 0~1
- * @param shd: shadow slider value
- * @param mid: midtone slider value
- * @param hlt: highlight slider value
- * @return modified single channel 0~1 (raw, no luminosity compensation)
+ * colorbalance_8bit_kernel (unchanged)
+ * 单通道原始 PS kernel：三区曲线 + 亮度权重插值
  */
 static inline gfloat colorbalance_8bit_kernel(gfloat inFloat,
                                               gdouble shd,
@@ -187,7 +176,6 @@ static inline gfloat colorbalance_8bit_kernel(gfloat inFloat,
     gfloat m = midtone(mid, in8);
     gfloat h = highlight(hlt, in8);
 
-    // luminance weight for shadow / midtone / highlight blend (your original weight)
     gfloat lum = in8 / 255.0f;
     gfloat w_shd, w_mid, w_hlt;
 
@@ -210,32 +198,81 @@ static inline gfloat colorbalance_8bit_kernel(gfloat inFloat,
 }
 
 /**
- * apply_zero_sum
- *  complementary zero-sum compensation per color axis
- * For CR/MG/YB deltas: apply reverse compensation to other two channels
- * dr, dg, db: raw delta from original PS kernel
- * returns compensated dr,dg,db, delta sum dr+dg+db = 0
+ * normalize_three_median
+ * 三个值排序，减去中位数。
+ * 三值相等时全部变成 0。
  */
-static inline void apply_zero_sum(gfloat dr, gfloat dg, gfloat db,
-                                         gfloat *dr_out, gfloat *dg_out, gfloat *db_out)
+static inline void normalize_three_median(gdouble *v)
 {
-    //  rule: each color axis's delta must be balanced by other two channels
-    // CR axis (Red): dr is primary change. G and B share total offset = dr
-    // MG axis (Green): dg is primary change. R and B share total offset = dg
-    // YB axis (Blue): db is primary change. R and G share total offset = db
+    gdouble a = v[0], b = v[1], c = v[2];
+    gdouble median;
+    if ((a <= b && b <= c) || (c <= b && b <= a))
+        median = b;
+    else if ((b <= a && a <= c) || (c <= a && a <= b))
+        median = a;
+    else
+        median = c;
+    v[0] -= median;
+    v[1] -= median;
+    v[2] -= median;
+}
 
-    gfloat comp_gb = dr;   // CR: G+B together subtract dr
-    gfloat comp_rb = dg;   // MG: R+B together subtract dg
-    gfloat comp_rg = db;   // YB: R+G together subtract db
+/**
+ * compute_effective_sliders
+ * 纯零和逻辑：
+ *   1. 每组三个滑块减去中位数归一化；
+ *   2. 高光：alpha_j = max(h_j,0) + sum_{k≠j} max(-h_k,0)
+ *      阴影：beta_j  = max(-s_j,0) + sum_{k≠j} max(s_k,0)
+ *   3. 中间调只归一化，直接作为有效滑块。
+ *
+ * 三滑块相等 → 归一化后全 0 → 有效滑块全 0 → kernel 返回输入。
+ */
+static void
+compute_effective_sliders(const gdouble *shd_in,
+                          const gdouble *mid_in,
+                          const gdouble *hlt_in,
+                          gdouble *eff_shd,
+                          gdouble *eff_mid,
+                          gdouble *eff_hlt)
+{
+    gdouble s[3] = { shd_in[0], shd_in[1], shd_in[2] };
+    gdouble m[3] = { mid_in[0], mid_in[1], mid_in[2] };
+    gdouble h[3] = { hlt_in[0], hlt_in[1], hlt_in[2] };
 
-    // distribute compensation equally between the two complementary channels
-    gfloat r_comp = (-comp_rb - comp_rg) / 2.0f;
-    gfloat g_comp = (-comp_gb - comp_rg) / 2.0f;
-    gfloat b_comp = (-comp_gb - comp_rb) / 2.0f;
+    normalize_three_median(s);
+    normalize_three_median(m);
+    normalize_three_median(h);
 
-    *dr_out = dr + r_comp;
-    *dg_out = dg + g_comp;
-    *db_out = db + b_comp;
+    for (int j = 0; j < 3; j++)
+    {
+        // ---- 阴影 ----
+        // beta_j 是压暗幅度 → C 滑块取负
+        gdouble beta_j = MAX(-s[j], 0.0);
+        for (int k = 0; k < 3; k++)
+            if (k != j)
+                beta_j += MAX(s[k], 0.0);
+        eff_shd[j] = -beta_j;
+
+        // ---- 高光 ----
+        // alpha_j 是提亮幅度 → C 滑块取正
+        gdouble alpha_j = MAX(h[j], 0.0);
+        for (int k = 0; k < 3; k++)
+            if (k != j)
+                alpha_j += MAX(-h[k], 0.0);
+        eff_hlt[j] = alpha_j;
+
+        // ---- 中间调 ----
+        // 纯零和：只归一化，不引入任何算法系数
+        eff_mid[j] = m[j];
+    }
+
+    // 统一 clamp 到 UI 范围
+    for (int j = 0; j < 3; j++)
+    {
+        eff_shd[j] = CLAMP(eff_shd[j], -100.0, 100.0);
+        eff_mid[j] = CLAMP(eff_mid[j], -100.0, 100.0);
+        eff_hlt[j] = CLAMP(eff_hlt[j], -100.0, 100.0);
+    }
 }
 
 static void
@@ -255,7 +292,6 @@ process(GeglOperation       *op,
   if (!roi || roi->width <= 0 || roi->height <= 0)
     return TRUE;
 
-  // read all slider parameters
   gdouble shd_cr, shd_mg, shd_yb;
   gdouble mid_cr, mid_mg, mid_yb;
   gdouble hlt_cr, hlt_mg, hlt_yb;
@@ -274,6 +310,19 @@ process(GeglOperation       *op,
     "preserve-luminosity", &preserve_lum,
     NULL);
 
+  // 预计算有效滑块（只在 preserve_lum 时用）
+  gdouble eff_shd[3] = { 0, 0, 0 };
+  gdouble eff_mid[3] = { 0, 0, 0 };
+  gdouble eff_hlt[3] = { 0, 0, 0 };
+
+  if (preserve_lum)
+  {
+      gdouble shd_in[3] = { shd_cr, shd_mg, shd_yb };
+      gdouble mid_in[3] = { mid_cr, mid_mg, mid_yb };
+      gdouble hlt_in[3] = { hlt_cr, hlt_mg, hlt_yb };
+      compute_effective_sliders(shd_in, mid_in, hlt_in, eff_shd, eff_mid, eff_hlt);
+  }
+
   gint stride = roi->width * 4;
   gfloat *in_line  = g_new(gfloat, stride);
   gfloat *out_line = g_new(gfloat, stride);
@@ -291,37 +340,25 @@ process(GeglOperation       *op,
       gfloat r_in = in_line[px + 0];
       gfloat g_in = in_line[px + 1];
       gfloat b_in = in_line[px + 2];
-      gfloat a = in_line[px + 3];
-
-      // Step 1: run your original raw PS kernel for each RGB channel
-      gfloat r_raw = colorbalance_8bit_kernel(r_in, shd_cr, mid_cr, hlt_cr);
-      gfloat g_raw = colorbalance_8bit_kernel(g_in, shd_mg, mid_mg, hlt_mg);
-      gfloat b_raw = colorbalance_8bit_kernel(b_in, shd_yb, mid_yb, hlt_yb);
+      gfloat a    = in_line[px + 3];
 
       gfloat r_out, g_out, b_out;
+
       if (preserve_lum)
       {
-          //  complementary zero-sum mode
-          gfloat dr_raw = r_raw - r_in;
-          gfloat dg_raw = g_raw - g_in;
-          gfloat db_raw = b_raw - b_in;
-
-          gfloat dr_comp, dg_comp, db_comp;
-          apply_zero_sum(dr_raw, dg_raw, db_raw, &dr_comp, &dg_comp, &db_comp);
-
-          r_out = r_in + dr_comp;
-          g_out = g_in + dg_comp;
-          b_out = b_in + db_comp;
+          // 用有效滑块调用你原有的 kernel
+          r_out = colorbalance_8bit_kernel(r_in, eff_shd[0], eff_mid[0], eff_hlt[0]);
+          g_out = colorbalance_8bit_kernel(g_in, eff_shd[1], eff_mid[1], eff_hlt[1]);
+          b_out = colorbalance_8bit_kernel(b_in, eff_shd[2], eff_mid[2], eff_hlt[2]);
       }
       else
       {
-          // NO preserve luminosity: original PS behavior, directly use raw result
-          r_out = r_raw;
-          g_out = g_raw;
-          b_out = b_raw;
+          // 原始 PS 行为：独立通道 kernel，用原始滑块
+          r_out = colorbalance_8bit_kernel(r_in, shd_cr, mid_cr, hlt_cr);
+          g_out = colorbalance_8bit_kernel(g_in, shd_mg, mid_mg, hlt_mg);
+          b_out = colorbalance_8bit_kernel(b_in, shd_yb, mid_yb, hlt_yb);
       }
 
-      // final clamp to valid sRGB float range 0~1
       r_out = CLAMP(r_out, 0.0f, 1.0f);
       g_out = CLAMP(g_out, 0.0f, 1.0f);
       b_out = CLAMP(b_out, 0.0f, 1.0f);
