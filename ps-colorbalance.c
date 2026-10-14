@@ -8,8 +8,10 @@
  *                               (normalize by median, then sign-aware
  *                                cross-channel redistribution)
  *
- * Your shadow/midtone/highlight curves are preserved.
  * Only the slider values are transformed before entering the kernel.
+ * CHANGED: No brightness segmentation / no weighted blend.
+ * Shadow, Midtone, Highlight curves apply sequentially to every pixel.
+ * All three curves fully act on every pixel, no region selection.
  *
  * Requirement: Input = Gamma encoded sRGB float 0~1. DO NOT use linear-rgb before this op.
  */
@@ -163,37 +165,24 @@ static inline gfloat shadow(gdouble value, gfloat input8)
 }
 
 /**
- * colorbalance_8bit_kernel (unchanged)
- * 单通道原始 PS kernel：三区曲线 + 亮度权重插值
+ * colorbalance_8bit_kernel
+ * CHANGED: No brightness region split, NO weighting/interpolation.
+ * Shadow, Midtone, Highlight curves apply sequentially in full to every pixel.
+ * Every pixel goes through all three curves one after another.
  */
 static inline gfloat colorbalance_8bit_kernel(gfloat inFloat,
                                               gdouble shd,
                                               gdouble mid,
                                               gdouble hlt)
 {
-    gfloat in8 = inFloat * 255.0f;
-    gfloat s = shadow(shd, in8);
-    gfloat m = midtone(mid, in8);
-    gfloat h = highlight(hlt, in8);
+    gfloat val = inFloat * 255.0f;
 
-    gfloat lum = in8 / 255.0f;
-    gfloat w_shd, w_mid, w_hlt;
+    // 全部像素依次应用三条曲线，全程生效，不分明暗
+    val = shadow(shd, val);
+    val = midtone(mid, val);
+    val = highlight(hlt, val);
 
-    if (lum < 0.33f) {
-        w_shd = 1.0f - lum / 0.33f;
-        w_mid = lum / 0.33f;
-        w_hlt = 0;
-    } else if (lum < 0.66f) {
-        w_shd = 0;
-        w_mid = 1.0f - (lum - 0.33f)/0.33f;
-        w_hlt = (lum -0.33f)/0.33f;
-    } else {
-        w_shd = 0;
-        w_mid = 0;
-        w_hlt = 1.0f;
-    }
-    gfloat out8 = s * w_shd + m * w_mid + h * w_hlt;
-    out8 = trimResult(out8);
+    gfloat out8 = trimResult(val);
     return out8 / 255.0f;
 }
 
@@ -218,12 +207,30 @@ static inline void normalize_three_median(gdouble *v)
 }
 
 /**
+ * zero_sum_redistribute
+ * 对零和三元组做符号感知的跨通道重分配：
+ *   sign = +1 → 本通道正向贡献 + 其他通道负向贡献的绝对值
+ *   sign = -1 → 本通道负向贡献 + 其他通道正向贡献（再整体取负）
+ *
+ * 结果保证：三个通道的有效值之和为 0（纯零和）。
+ */
+static inline gdouble
+zero_sum_redistribute(const gdouble *v, int j, gdouble sign)
+{
+    gdouble acc = MAX(sign * v[j], 0.0);
+    for (int k = 0; k < 3; k++)
+        if (k != j)
+            acc += MAX(-sign * v[k], 0.0);
+    return sign * acc;
+}
+
+/**
  * compute_effective_sliders
- * 纯零和逻辑：
+ * 纯零和逻辑（三区一致）：
  *   1. 每组三个滑块减去中位数归一化；
- *   2. 高光：alpha_j = max(h_j,0) + sum_{k≠j} max(-h_k,0)
- *      阴影：beta_j  = max(-s_j,0) + sum_{k≠j} max(s_k,0)
- *   3. 中间调只归一化，直接作为有效滑块。
+ *   2. 阴影、中间调、高光使用同一符号感知跨通道重分配算法：
+ *        - 阴影以压暗方向（sign = -1）重分配；
+ *        - 中间调与高光以提亮方向（sign = +1）重分配；
  *
  * 三滑块相等 → 归一化后全 0 → 有效滑块全 0 → kernel 返回输入。
  */
@@ -245,25 +252,14 @@ compute_effective_sliders(const gdouble *shd_in,
 
     for (int j = 0; j < 3; j++)
     {
-        // ---- 阴影 ----
-        // beta_j 是压暗幅度 → C 滑块取负
-        gdouble beta_j = MAX(-s[j], 0.0);
-        for (int k = 0; k < 3; k++)
-            if (k != j)
-                beta_j += MAX(s[k], 0.0);
-        eff_shd[j] = -beta_j;
+        // 阴影：压暗方向（sign = -1）
+        eff_shd[j] = zero_sum_redistribute(s, j, -1.0);
 
-        // ---- 高光 ----
-        // alpha_j 是提亮幅度 → C 滑块取正
-        gdouble alpha_j = MAX(h[j], 0.0);
-        for (int k = 0; k < 3; k++)
-            if (k != j)
-                alpha_j += MAX(-h[k], 0.0);
-        eff_hlt[j] = alpha_j;
+        // 高光：提亮方向（sign = +1）
+        eff_hlt[j] = zero_sum_redistribute(h, j, -1.0);
 
-        // ---- 中间调 ----
-        // 纯零和：只归一化，不引入任何算法系数
-        eff_mid[j] = m[j];
+        // 中间调：与高光完全一致的提亮方向（sign = +1）
+        eff_mid[j] = zero_sum_redistribute(m, j, -1.0);
     }
 
     // 统一 clamp 到 UI 范围
@@ -346,7 +342,7 @@ process(GeglOperation       *op,
 
       if (preserve_lum)
       {
-          // 用有效滑块调用你原有的 kernel
+          // 用有效滑块调用原有 kernel
           r_out = colorbalance_8bit_kernel(r_in, eff_shd[0], eff_mid[0], eff_hlt[0]);
           g_out = colorbalance_8bit_kernel(g_in, eff_shd[1], eff_mid[1], eff_hlt[1]);
           b_out = colorbalance_8bit_kernel(b_in, eff_shd[2], eff_mid[2], eff_hlt[2]);
@@ -390,9 +386,9 @@ gegl_op_class_init(GeglOpClass *klass)
   gegl_operation_class_set_keys(oclass,
     "name",        "lb:ps-colorbalance",
     "title",       _("PS Color Balance"),
-    "description", _("PS Color Balance 8bit sRGB. "),
+    "description", _("PS Color Balance"),
     "gimp:menu-path", "<Image>/Colors/myfilters",
-    "gimp:menu-label", _("PS Color Balance 8bit..."),
+    "gimp:menu-label", _("PS Color Balance"),
     NULL);
 }
 
